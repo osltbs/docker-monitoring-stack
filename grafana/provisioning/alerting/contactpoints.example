@@ -1,0 +1,37 @@
+# Точка контакта — канал доставки уведомлений.
+#
+# ЭТО ШАБЛОН. Скопируй и заполни:
+#   cp contactpoints.example contactpoints.yml
+#   chmod 644 contactpoints.yml
+#
+# Файл contactpoints.yml исключён из Git — в нём токен бота.
+#
+# Права именно 644, а не 600: Grafana в контейнере работает под UID 472,
+# при 600 файл принадлежит хостовому пользователю и процесс получает
+# permission denied — контейнер уйдёт в цикл перезапусков.
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    # имя, на которое ссылается policies.yml в поле receiver.
+    # Должно совпадать посимвольно
+    name: telegram
+    receivers:
+      - uid: telegram-main
+        type: telegram
+        settings:
+          # Токен бота. Получить: @BotFather → /newbot
+          # Формат: 1234567890:AAF...
+          bottoken: ""
+          # Идентификатор чата. Написать боту любое сообщение, затем открыть
+          # https://api.telegram.org/bot<ТОКЕН>/getUpdates и найти chat.id
+          # Для личных сообщений положительный, для групп отрицательный
+          chatid: ""
+
+# ВАЖНО: api.telegram.org с сервера может быть заблокирован. В этом стеке
+# Grafana ходит через SOCKS5-прокси — см. HTTP_PROXY в compose.yaml
+# и раздел про туннели в README.
+#
+# Проверка доставки: Alerting → Contact points → Test.
+# Настоящая проверка — вызвать срабатывание правила:
+#   docker compose stop node-exporter && sleep 240 && docker compose start node-exporter

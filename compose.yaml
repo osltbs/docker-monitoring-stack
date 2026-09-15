@@ -1,0 +1,286 @@
+services:
+  # Создание контейнера Prometheus для сбора метрик
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      # первые два флага — из CMD образа, их нельзя потерять
+      # секция command заменяет CMD целиком
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # ретенция: срабатывает то, что наступит раньше
+      - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.retention.size=2GB
+      # позволяет перечитать конфиг без перезапуска
+      - --web.enable-lifecycle
+    volumes:
+      # первый - bind mount на конфиг prometheus; 
+      # второй - bind mount на правила оповещения для Prometheus (уведомлений не шлёт, нужен Alertmanager); 
+      # третий - монтирование тома для контейнера.
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - promdata:/prometheus
+    ports:
+      # публикация порта контейнера, только в loopback хоста — снаружи виртуалки недоступен
+      - "127.0.0.1:9090:9090"
+    # автоматический перезапуск контейнера, если не был остановлен вручную.
+    # отличие от always — что после ручной остановки контейнер не поднимется при перезагрузке хоста.
+    restart: unless-stopped
+    # прикрепление контейнера к сети. Общая сеть проекта, в ней работает разрешение имён между сервисами
+    networks: [monitoring]
+    # логи уходят в Loki напрямую из демона Docker, минуя файлы
+    logging:
+      driver: loki
+      options:
+        # плагин работает на хосте и сети Docker не видит
+        loki-url: "http://localhost:3100/loki/api/v1/push"
+        loki-external-labels: "job=docker,service=prometheus"
+        # если Loki не отвечает, складывает логи в буфер и продолжает работу.
+        # при переполнении буфера старые записи отбрасываются - лучше потерять часть логов, чем потерять сервис.
+        mode: non-blocking
+        # Размер этого буфера
+        max-buffer-size: 4m
+    healthcheck:
+      # CMD — ключевое слово формата, а не команда: выполнить напрямую без sh
+      # --spider: только проверить доступность, не скачивать
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      # как часто проверять
+      interval: 10s
+      # сколько ждать ответа
+      timeout: 3s
+      # сколько неудач подряд означают «нездоров»
+      retries: 5
+      # льготное время на запуск: неудачи в этот период не считаются
+      start_period: 10s
+    # Ограничение RAM на 512 мегабайт
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+  # node-exporter — метрики хоста: процессор, память, диск, сеть, часы.
+  # Намеренно нарушает изоляцию: его задача рассказать про машину,
+  # а не про себя. Без этих настроек отчитывался бы о собственном контейнере.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    # PID namespace хоста: видит все процессы системы, а не только свои
+    pid: host
+    volumes:
+      # корень хоста только на чтение;
+      # rslave — новые монтирования на хосте становятся видны внутри,
+      # обратно ничего не распространяется
+      - /:/host:ro,rslave
+    command:
+      # искать /proc и /sys по префиксу /host, а не свои собственные
+      - '--path.rootfs=/host'
+    restart: unless-stopped
+    networks: [monitoring]
+    logging:
+      driver: loki
+      options:
+        # localhost, а не имя сервиса: плагин работает на хосте,
+        # сеть Docker ему недоступна
+        loki-url: "http://localhost:3100/loki/api/v1/push"
+        loki-external-labels: "job=docker,service=node-exporter"
+        # при недоступности Loki логи копятся в буфере,
+        # а не блокируют контейнер
+        mode: non-blocking
+        max-buffer-size: 4m
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+  # Создание контейнера Grafana — визуализация метрик и логов, вычисление правил, уведомления
+  grafana:
+    image: grafana/grafana:11.5.1
+    # host.docker.internal резолвится в шлюз текущей сети автоматически —
+    # не зависит от того, какую подсеть выдал Docker при пересоздании
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # обязательная переменная: без .env compose откажется запускаться,
+      # вместо того чтобы стартовать с паролем по умолчанию
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?переменная не задана, создай .env}
+      # запрет самостоятельной регистрации новых пользователей
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # прокси для уведомлений: api.telegram.org,
+      # трафик идёт через SOCKS5 на хосте (обратный SSH-туннель)
+      HTTP_PROXY: "socks5://host.docker.internal:10808"
+      HTTPS_PROXY: "socks5://host.docker.internal:10808"
+      # без NO_PROXY Grafana пойдёт к Prometheus и Loki через прокси — сломается
+      NO_PROXY: "localhost,127.0.0.1,prometheus,loki,node-exporter,cadvisor,promtail"
+      # отключение обращений к grafana.com: они недоступны без прокси
+      # и задерживают старт на таймауты
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+    volumes:
+      # том: база Grafana — дашборды из UI, пользователи, история алертов
+      - grafanadata:/var/lib/grafana
+      # provisioning: источники данных, правила, точка контакта, политика
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # дашборды как код — правятся файлами, не через интерфейс
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+    ports:
+      # только loopback хоста: снаружи виртуалки недоступна,
+      # доступ через SSH-туннель
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+    networks: [monitoring]
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://localhost:3100/loki/api/v1/push"
+        loki-external-labels: "job=docker,service=grafana"
+        mode: non-blocking
+        max-buffer-size: 4m
+    # ждём готовности источников данных, а не просто их запуска:
+    # без condition Grafana стартовала бы раньше и получила connection refused
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # Loki — приём и хранение логов.
+  #
+  # ВНИМАНИЕ: у этого сервиса намеренно НЕТ блока logging с драйвером loki.
+  # Он не может отправлять логи в себя до собственного запуска — получается
+  # круговая зависимость, при которой контейнер не завершается ни по SIGTERM,
+  # ни по SIGKILL. Работает на стандартном json-file, логи доступны через
+  # docker compose logs loki — что важно именно тогда, когда Loki недоступен.
+  #
+  # Отсюда же требование запускать его первым: docker compose up -d loki
+  loki:
+    image: grafana/loki:3.3.2
+    # свой конфиг вместо встроенного local-config.yaml — ради ретенции.
+    # command заменяет CMD образа целиком, но у Loki там только этот флаг
+    command: -config.file=/etc/loki/loki-config.yaml
+    volumes:
+      # конфиг с ретенцией 168h и включённым компактором.
+      # вытащен из образа и дополнен:
+      # docker run --rm --entrypoint cat grafana/loki:3.3.2 \
+      #   /etc/loki/local-config.yaml > loki/loki-config.yaml
+      - ./loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      # том с чанками логов и индексом
+      - lokidata:/loki
+    ports:
+      # только loopback хоста; драйвер логирования обращается сюда же
+      - "127.0.0.1:3100:3100"
+    restart: unless-stopped
+    networks: [monitoring]
+    healthcheck:
+      # /ready отвечает, когда Loki готов принимать запись
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      # больше, чем у Prometheus: Loki поднимает несколько внутренних
+      # компонентов и присоединяется к кольцу
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # promtail — агент сбора системных логов хоста из /var/log.
+  # Драйвер логирования Docker собирает только stdout контейнеров,
+  # системные логи он не видит — отсюда отдельный агент.
+  #
+  # ВНИМАНИЕ: у этого сервиса намеренно НЕТ блока logging с драйвером loki.
+  # Агент сбора логов не должен зависеть от приёмника, которому их отправляет.
+  # При подключённом драйвере контейнер не завершался ни по SIGTERM, ни по
+  # SIGKILL: ждал записи в Loki, которого уже не было. В тяжёлых случаях
+  # блокировался сам демон Docker.
+  promtail:
+    image: grafana/promtail:3.3.2
+    command: -config.file=/etc/promtail/config.yml -config.expand-env=true
+    environment:
+      HOSTNAME: ${HOSTNAME}
+    volumes:
+      # какие файлы читать и куда отправлять
+      - ./promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      # системные логи хоста только на чтение: syslog, auth.log, kern.log, ufw.log
+      - /var/log:/var/log:ro
+      - promtailpos:/tmp
+    restart: unless-stopped
+    networks: [monitoring]
+    # service_started, а не service_healthy: promtail переживает временную
+    # недоступность Loki — он ретраит и помнит позиции в файлах,
+    # так что после восстановления дочитает с того места, где остановился
+    depends_on:
+      loki:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # cadvisor — метрики контейнеров: процессор, память, сеть по каждому.
+  # node-exporter рассказывает про хост целиком и отдельные контейнеры не видит.
+  # порт наружу не публикуется, Prometheus ходит изнутри сети по имени.
+  # ВАЖНО: версия не ниже 0.55. Docker использует драйвер хранения overlayfs,
+  # который держит метаданные слоёв в базе, а не в /var/lib/docker/image/<driver>/
+  # layerdb/. Версия 0.49.1 ищет их по старому пути, не может создать объекты
+  # контейнеров и отдаёт единственную серию с id="/" вместо метрик по каждому.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.55.1
+    # привилегированный режим: нужен доступ к cgroups всех контейнеров.
+    # Осознанное исключение, более серьёзное, чем у node-exporter
+    privileged: true
+    devices:
+      # доступ к кольцевому буферу ядра — события OOM и ошибки
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      # сокет Docker — для сопоставления cgroup с именами контейнеров
+      - /var/run:/var/run:ro
+      # cgroups: отсюда берутся метрики процессора и памяти
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    command:
+      # только контейнеры Docker: без этого приедут сотни системных cgroups
+      - '--docker_only=true'
+      - '--housekeeping_interval=15s'
+      # отключение метрик, которые не использует ни одна панель и ни одно
+      # правило: сокращает кардинальность. advtcp давал 2574 ряда из 9000
+      - '--disable_metrics=disk,diskIO,advtcp,tcp,udp,sched,process'
+      # без этого каждая серия тащит девять пустых меток container_label_*
+      - '--store_container_labels=false'
+    restart: unless-stopped
+    networks: [monitoring]
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://localhost:3100/loki/api/v1/push"
+        loki-external-labels: "job=docker,service=cadvisor"
+        mode: non-blocking
+        max-buffer-size: 4m
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+# Именованные тома. Создаются автоматически при первом запуске,
+# переживают docker compose down. Уничтожаются только флагом -v:
+# docker compose down -v сотрёт историю метрик, логи, дашборды и
+# пользователей Grafana без возможности восстановления.
+#
+# Физически лежат в /var/lib/docker/volumes/monitoring_<имя>/_data
+# Размеры: docker system df -v
+volumes:
+  promdata:      # база метрик Prometheus, ретенция 7d / 2GB
+  grafanadata:   # SQLite Grafana: дашборды из UI, пользователи, история алертов
+  lokidata:      # чанки логов и индекс, ретенция 168h
+  promtailpos:   # позиции чтения файлов promtail — чтобы не перечитывать логи заново
+
+# Сеть проекта. В ней работает встроенный DNS Docker (127.0.0.11),
+# поэтому сервисы обращаются друг к другу по именам: http://loki:3100,
+# node-exporter:9100. На дефолтном мосту docker0 разрешение имён не работает.
+#
+# Реальное имя получает префикс проекта: monitoring_monitoring
+networks:
+  monitoring:

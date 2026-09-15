@@ -1,0 +1,12 @@
+# Секреты
+.env
+.env.*
+!.env.example
+grafana/provisioning/alerting/contactpoints.yml
+
+# Бэкапы томов
+*.tar.gz
+
+# Системное
+.DS_Store
+Thumbs.db

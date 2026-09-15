@@ -1,0 +1,56 @@
+# Правила оповещения Prometheus.
+#
+# ВАЖНО: Prometheus их ВЫЧИСЛЯЕТ и показывает состояние на страницах
+# /rules и /alerts, но уведомлений НЕ ОТПРАВЛЯЕТ — для этого нужен
+# Alertmanager, которого в стеке нет.
+#
+# Рабочие алерты с доставкой в Telegram ведутся средствами Grafana:
+# grafana/provisioning/alerting/rules.yml — там 16 правил.
+#
+# Эти оставлены как дублирующая проверка и как пример декларативных
+# правил в Git. Видны в интерфейсе Grafana благодаря manageAlerts: true
+# в источнике данных.
+#
+# Проверить, что загружены:
+#   curl -s localhost:9090/api/v1/rules | python3 -m json.tool | grep '"name"'
+# Применить после правки без перезапуска:
+#   curl -X POST localhost:9090/-/reload
+
+groups:
+  - name: disk
+    rules:
+      - alert: DiskSpaceLow
+        # блочный скаляр | сохраняет переносы — выражение читается в две строки
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/",fstype!="tmpfs"}
+          / node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"} * 100 < 20
+        # условие должно держаться 10 минут — защита от кратковременных всплесков
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Свободно менее 20% на корневом разделе"
+          description: "Осталось {{ $value | printf \"%.1f\" }}% на {{ $labels.instance }}"
+
+      - alert: DiskSpaceCritical
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/",fstype!="tmpfs"}
+          / node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"} * 100 < 10
+        # порог ниже — реагируем быстрее
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Критически мало места на корневом разделе"
+          description: "Осталось {{ $value | printf \"%.1f\" }}% на {{ $labels.instance }}"
+
+  - name: memory
+    rules:
+      - alert: MemoryLow
+        expr: |
+          node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100 < 15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Свободно менее 15% оперативной памяти"

@@ -1,0 +1,890 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Правила оповещения Grafana — 16 правил в пяти группах.
+#
+# ВАЖНО: это РАБОЧИЕ алерты с доставкой в Telegram. Правила Prometheus
+# в prometheus/rules/alerts.yml вычисляются, но уведомлений не шлют —
+# для этого нужен Alertmanager, которого в стеке нет.
+#
+# ── Структура правила ──────────────────────────────────────────────────────
+# Каждое правило состоит из двух блоков data:
+#   refId A — запрос к источнику (datasourceUid: prometheus либо loki),
+#             instant: true — одно текущее значение, а не диапазон
+#   refId B — пороговое условие (datasourceUid: __expr__ — встроенный
+#             вычислитель Grafana, не настоящий источник)
+# condition: B означает, что результат B и есть условие срабатывания.
+#
+# ── Состояния ──────────────────────────────────────────────────────────────
+#   Normal   → условие не выполнено
+#   Pending  → выполнено, идёт отсчёт for
+#   Alerting → for истёк, уведомление ушло в политику маршрутизации
+#   Resolved → условие ушло, уведомление о разрешении
+# Срабатывание НЕ мгновенное: for защищает от кратковременных всплесков.
+#
+# ── noDataState ────────────────────────────────────────────────────────────
+# Что делать, когда запрос вернул пустоту:
+#   OK       — правила про ресурсы: мерить нечего, молчим.
+#              О причине сообщит target-down, дублировать незачем
+#   Alerting — правила про доступность мониторинга: нет данных даже
+#              по метрике up — значит упал сам Prometheus
+# Без этого при остановке node-exporter приходили три бесполезных
+# уведомления DatasourceNoData вместо одного осмысленного.
+#
+# ── Перед добавлением правила ──────────────────────────────────────────────
+# Прогнать запрос и посмотреть на число серий:
+#   curl -sG 'localhost:9090/api/v1/query' --data-urlencode 'query=ВЫРАЖЕНИЕ' \
+#     | python3 -c 'import sys,json; r=json.load(sys.stdin)["data"]["result"]; \
+#       print("серий:", len(r), "| пример:", r[0]["value"][1] if r else "нет")'
+#
+#   0 серий      — правило будет молчать (несопоставимые метки)
+#   больше одной — возможны ложные срабатывания по каждой серии
+#   +Inf         — деление на ноль
+#
+# ── Проверка после правки ──────────────────────────────────────────────────
+#   python3 -c "import yaml;yaml.safe_load(open('rules.yml'))" && echo ок
+#   docker compose up -d --force-recreate grafana
+#   curl -s -u admin localhost:3000/api/v1/provisioning/alert-rules \
+#     | python3 -m json.tool | grep '"title"' | wc -l
+#
+# Настоящая проверка — вызвать срабатывание, а не нажать Test:
+#   docker compose stop node-exporter && sleep 240 && docker compose start node-exporter
+# ═══════════════════════════════════════════════════════════════════════════
+
+apiVersion: 1
+groups:
+- orgId: 1
+  name: disk
+  folder: Инфраструктура
+  interval: 1m
+  rules:
+
+  # По тренду за 6 часов: кончится ли место в ближайшие 4 часа.
+  # Самое ценное правило набора — предупреждает, пока есть время на реакцию,
+  # в отличие от порога «осталось 10%», который срабатывает, когда уже поздно.
+  - uid: disk-predict-full
+    title: 'Прогноз: диск заполнится за 4 часа'
+    condition: B
+    for: 30m
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: warning
+    annotations:
+      summary: По текущему тренду свободное место на / кончится в ближайшие 4 часа
+      description: Прогноз построен по данным за последние 6 часов
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: predict_linear(node_filesystem_avail_bytes{mountpoint="/",fstype!="tmpfs"}[6h], 4*3600)
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 0
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+
+  # Классический порог: свободно менее 20% на корневом разделе.
+  - uid: disk-space-low
+    title: Мало места на диске
+    condition: B
+    for: 10m
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: warning
+    annotations:
+      summary: Свободно менее 20% на корневом разделе
+      description: Осталось {{ printf "%.1f" $values.A.Value }}%
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: node_filesystem_avail_bytes{mountpoint="/",fstype!="tmpfs"} / node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"}
+          * 100
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 20
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+
+  # Тот же запрос, порог ниже и for короче — реагируем быстрее.
+  - uid: disk-space-critical
+    title: Критически мало места на диске
+    condition: B
+    for: 5m
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: critical
+    annotations:
+      summary: Свободно менее 10% на корневом разделе
+      description: Осталось {{ printf "%.1f" $values.A.Value }}%
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: node_filesystem_avail_bytes{mountpoint="/",fstype!="tmpfs"} / node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"}
+          * 100
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 10
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+
+  # inode кончаются независимо от места: диск показывает свободные гигабайты,
+  # а запись падает с No space left on device. Классика на серверах
+  # с миллионами мелких файлов.
+  - uid: disk-inodes-low
+    title: Нехватка inode
+    condition: B
+    for: 15m
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: warning
+    annotations:
+      summary: Свободно менее 15% inode — запись упадёт при формально свободном диске
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: node_filesystem_files_free{mountpoint="/"} / node_filesystem_files{mountpoint="/"} * 100
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 15
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+
+  # Процент времени, когда процессор простаивает в ожидании диска.
+  # Выше 20% — диск стал узким местом.
+  - uid: disk-iowait-high
+    title: Высокое время ожидания диска
+    condition: B
+    for: 15m
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: warning
+    annotations:
+      summary: iowait выше 20% — диск стал узким местом
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: avg(rate(node_cpu_seconds_total{mode="iowait"}[5m])) * 100
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 20
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+- orgId: 1
+  name: memory-cpu
+  folder: Инфраструктура
+  interval: 1m
+  rules:
+
+  # Доступно менее 15% оперативной памяти.
+  - uid: memory-low
+    title: Мало оперативной памяти
+    condition: B
+    for: 10m
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: warning
+    annotations:
+      summary: Доступно менее 15% оперативной памяти
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 15
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+
+  # Активный своп означает, что памяти уже не хватает и производительность
+  # просела, даже если формально всё работает.
+  - uid: swap-in-use
+    title: Активное использование swap
+    condition: B
+    for: 15m
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: warning
+    annotations:
+      summary: Занято более 30% swap — памяти не хватает, производительность просела
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: (node_memory_SwapTotal_bytes - node_memory_SwapFree_bytes) / node_memory_SwapTotal_bytes * 100
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 30
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+
+  # Ядро убило процесс из-за нехватки памяти. for: 0m — реагируем сразу,
+  # факт убийства уже состоялся, ждать нечего.
+  - uid: oom-kills
+    title: Ядро убивает процессы по OOM
+    condition: B
+    for: 0m
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: critical
+    annotations:
+      summary: За последние 10 минут ядро убило процесс из-за нехватки памяти
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: increase(node_vmstat_oom_kill[10m])
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 0
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+
+  # Load average на ядро. on() group_left обязателен: у node_load5 есть метки
+  # instance и job, у результата агрегации их нет, и без явного сопоставления
+  # Prometheus вернул бы ПУСТОТУ — правило молчало бы навсегда.
+  # group_left сохраняет метки левой стороны, чтобы в уведомлении был instance.
+  - uid: load-high
+    title: Высокая нагрузка на процессор
+    condition: B
+    for: 15m
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: warning
+    annotations:
+      summary: Load average на ядро выше 1.5 — очередь задач растёт
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: node_load5 / on() group_left count(count(node_cpu_seconds_total) by (cpu))
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 1.5
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+
+  # Расхождение системных часов. Ломает аутентификацию Kerberos, проверку
+  # сертификатов TLS, корреляцию логов и репликацию баз.
+  - uid: clock-drift
+    title: Расхождение системных часов
+    condition: B
+    for: 5m
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: warning
+    annotations:
+      summary: Часы разошлись более чем на полсекунды — сломается аутентификация, TLS и корреляция логов
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: abs(node_timex_offset_seconds)
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 0.5
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+- orgId: 1
+  name: stack
+  folder: Инфраструктура
+  interval: 1m
+  rules:
+
+  # up — служебная метрика Prometheus, равна нулю, когда цель не отвечает.
+  # Ловит падение любого экспортера и проблемы сети между контейнерами.
+  # noDataState: Alerting — если нет данных даже по up, значит упал Prometheus.
+  - uid: target-down
+    title: Цель мониторинга недоступна
+    condition: B
+    for: 2m
+    noDataState: Alerting
+    execErrState: Alerting
+    labels:
+      severity: critical
+    annotations:
+      summary: Prometheus не может собрать метрики с {{ $labels.instance }}
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: up
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 1
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+
+  # Мониторинг, который молча перестал собирать метрики, хуже отсутствующего.
+  # sum обязателен: метрика приходит двумя сериями — type="float" (обычные
+  # отсчёты) и type="histogram" (нативные гистограммы, у нас всегда ноль).
+  # Без агрегации правило видело ноль у гистограмм и слало ложную тревогу.
+  - uid: prometheus-not-ingesting
+    title: Prometheus перестал принимать данные
+    condition: B
+    for: 10m
+    noDataState: Alerting
+    execErrState: Alerting
+    labels:
+      severity: critical
+    annotations:
+      summary: Скорость записи метрик близка к нулю — мониторинг ослеп
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: sum(rate(prometheus_tsdb_head_samples_appended_total[10m]))
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 0.01
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+
+  # Логи не поступают в Loki. for больше, чем у метрик: поток логов
+  # неравномерный, и короткие паузы нормальны.
+  - uid: loki-not-ingesting
+    title: Loki перестал принимать логи
+    condition: B
+    for: 15m
+    noDataState: Alerting
+    execErrState: Error
+    labels:
+      severity: warning
+    annotations:
+      summary: Логи не поступают в Loki
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: sum(rate(loki_distributor_lines_received_total[10m]))
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 0.01
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+- orgId: 1
+  name: containers
+  folder: Инфраструктура
+  interval: 1m
+  rules:
+
+  # Контейнер падает и поднимается по кругу. Часто единственный признак
+  # проблемы до того, как её заметят пользователи.
+  - uid: container-restarting
+    title: Контейнер перезапускается циклически
+    condition: B
+    for: 10m
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: critical
+    annotations:
+      summary: Контейнер {{ $labels.name }} перезапустился более 2 раз за 15 минут
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: changes(container_start_time_seconds{name!=""}[15m])
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 2
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+
+  # Предупреждение ДО OOM, а не после. Работает только при заданных лимитах
+  # памяти — у всех сервисов стека они есть в deploy.resources.limits.
+  - uid: container-memory-near-limit
+    title: Контейнер у предела памяти
+    condition: B
+    for: 10m
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: warning
+    annotations:
+      summary: Контейнер {{ $labels.name }} использует более 85% своего лимита памяти
+      description: Занято {{ printf "%.1f" $values.A.Value }}% от лимита
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: container_memory_usage_bytes{name!=""} / container_spec_memory_limit_bytes{name!=""} * 100
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 85
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
+- orgId: 1
+  name: logs
+  folder: Инфраструктура
+  interval: 1m
+  rules:
+
+  # Единственное правило с источником Loki, а не Prometheus: условие
+  # проверяется по ЛОГАМ через LogQL. count_over_time считает строки
+  # за окно, sum схлопывает потоки в одно число.
+  - uid: ssh-bruteforce
+    title: Всплеск неудачных входов по SSH
+    condition: B
+    for: 0m
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: warning
+    annotations:
+      summary: Более 20 неудачных попыток входа за 10 минут — похоже на подбор пароля
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: loki
+      model:
+        editorMode: code
+        expr: sum(count_over_time({job="varlogs"} |~ "Failed password" [10m]))
+        queryType: instant
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 20
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query
