@@ -1,0 +1,64 @@
+# Конфиг Loki. Вытащен из образа и дополнен ретенцией:
+#   docker run --rm --entrypoint cat grafana/loki:3.3.2 \
+#     /etc/loki/local-config.yaml > loki/loki-config.yaml
+
+# Аутентификация отключена — Loki слушает только в сети Docker
+# и публикуется в loopback хоста. В проде с внешним доступом нужен
+# обратный прокси с авторизацией
+auth_enabled: false
+
+# Компактор — единственный компонент, который физически удаляет старые данные.
+# Без retention_enabled: true параметр retention_period ниже НЕ РАБОТАЕТ:
+# Loki сам по себе ничего не удаляет
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+  compaction_interval: 10m
+  # задержка перед физическим удалением — страховка от ошибки в настройках
+  retention_delete_delay: 2h
+
+server:
+  # порт для приёма логов и запросов. Сюда обращаются:
+  # promtail (по имени loki:3100), драйвер логирования (localhost:3100 с хоста),
+  # Grafana (по имени loki:3100)
+  http_listen_port: 3100
+
+common:
+  instance_addr: 127.0.0.1
+  # корень данных — совпадает с точкой монтирования тома lokidata
+  path_prefix: /loki
+  storage:
+    # хранение в файлах, без S3 и прочих объектных хранилищ
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  # один экземпляр, кластера нет
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+limits_config:
+  # срок хранения логов — неделя. Согласован с ретенцией Prometheus (7d),
+  # иначе в Grafana метрики за период были бы, а логи уже удалены
+  retention_period: 168h
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+# Alertmanager в стеке нет — алерты ведутся средствами Grafana.
+#ruler:
+#  alertmanager_url: http://localhost:9093
+
+# Отправка анонимной статистики в Grafana Labs отключена:
+# интернет с сервера ограничен, попытки соединения дают таймауты
+analytics:
+  reporting_enabled: false
