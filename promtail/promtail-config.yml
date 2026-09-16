@@ -1,35 +1,74 @@
-# promtail — агент сбора системных логов хоста.
-# Драйвер логирования Docker собирает только stdout контейнеров;
-# системные логи (auth.log, kern.log, ufw.log) он не видит.
+# promtail — сбор логов. В этой версии читает два источника:
+#   1. системные логи хоста из /var/log
+#   2. логи всех контейнеров из /var/lib/docker/containers/*/*-json.log
+#
+# Драйвер логирования Loki не используется: демон пишет в файлы, promtail их
+# читает. Нет круговой зависимости, нет требования запускать Loki первым,
+# docker compose logs работает для всех сервисов.
 
 server:
-  # порт для метрик promtail — Prometheus скрейпит его по имени promtail:9080.
-  # Наружу не публикуется
   http_listen_port: 9080
 
 positions:
-  # запоминает, до какого места дочитан каждый файл.
-  # При перезапуске продолжает с той же позиции, а не с начала —
-  # поэтому каталог вынесен в том, иначе после пересоздания
+  # позиции чтения в томе promtailpos — иначе после пересоздания контейнера
   # все логи приедут в Loki заново
   filename: /tmp/positions.yaml
 
 clients:
-  # по имени сервиса — работает встроенный DNS Docker в сети проекта.
-  # Здесь именно http://loki:3100, а не localhost: promtail внутри контейнера,
-  # в отличие от драйвера логирования, который работает на хосте
   - url: http://loki:3100/loki/api/v1/push
 
 scrape_configs:
+
+  # ── Системные логи хоста ────────────────────────────────────────────────
   - job_name: system
     static_configs:
       - targets: [localhost]
         labels:
-          # метки для фильтрации в Grafana: {job="varlogs"}
           job: varlogs
-          # имя хоста берётся из окружения, чтобы конфиг не был привязан
-          # к конкретной машине. Требует флага -config.expand-env=true
           host: ${HOSTNAME:-unknown}
-          # какие файлы читать. К каждой строке добавится метка filename
-          # с полным путём — по ней фильтруются панели дашборда «Логи»
           __path__: /var/log/*log
+
+  # ── Логи контейнеров ────────────────────────────────────────────────────
+  # Docker пишет их построчным JSON: {"log":"...","stream":"stdout","time":"..."}
+  - job_name: containers
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: containerlogs
+          host: ${HOSTNAME:-unknown}
+          __path__: /var/lib/docker/containers/*/*-json.log
+
+    pipeline_stages:
+      # 1. разобрать JSON и достать поля
+      - json:
+          expressions:
+            output: log
+            stream: stream
+            timestamp: time
+
+      # 2. взять время из лога, а не момент чтения файла
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+
+      # 3. stdout или stderr — в метку
+      - labels:
+          stream:
+
+      # 4. вытащить ID контейнера из пути к файлу
+      #    /var/lib/docker/containers/<64 символа>/<...>-json.log
+      - regex:
+          source: filename
+          expression: '/var/lib/docker/containers/(?P<container_id>[0-9a-f]{64})/.*-json\.log'
+
+      # 5. короткий ID как метка — полный слишком длинный для удобства
+      - template:
+          source: container_id
+          template: '{{ .Value | trunc 12 }}'
+
+      - labels:
+          container_id:
+
+      # 6. в поток уходит только текст строки, без обёртки JSON
+      - output:
+          source: output

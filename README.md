@@ -4,6 +4,8 @@ Prometheus, Grafana, Loki, promtail, cadvisor и node-exporter в контейн
 
 Учебный проект с прицелом на эксплуатационную пригодность: тома для данных, конфиги в Git, ограничения ресурсов, проверки готовности, ретенция, работающие оповещения. Всё настраивается файлами — дашборды, источники данных и правила алертов лежат в репозитории, а не в базе Grafana.
 
+> **Ветка `file-logs`.** Логи контейнеров собираются чтением файлов, а не драйвером логирования Loki. Отличия от `main` — в разделе [«Две реализации сбора логов»](#две-реализации-сбора-логов).
+
 ---
 
 ## Состав
@@ -14,12 +16,12 @@ Prometheus, Grafana, Loki, promtail, cadvisor и node-exporter в контейн
 | node-exporter | метрики хоста                         | 9100 (только внутри сети) |
 | cadvisor      | метрики контейнеров из cgroups        | 8080 (только внутри сети) |
 | loki          | приём и хранение логов                | 3100 (loopback)           |
-| promtail      | сбор системных логов из `/var/log`    | 9080 (только внутри сети) |
+| promtail      | сбор логов: `/var/log` и контейнеры   | 9080 (только внутри сети) |
 | grafana       | визуализация, алерты, уведомления     | 3000 (loopback)           |
 
 Публикуемые порты слушают только `127.0.0.1` — снаружи виртуалки недоступны, доступ через SSH-туннель.
 
-**Что получается:** 4 дашборда (36 панелей), 16 правил оповещения, ретенция метрик и логов по 7 дней.
+**Что получается:** 4 дашборда (36 панелей), 16 правил оповещения, ретенция метрик и логов по 7 дней, стек поднимается одной командой без порядка запуска.
 
 ---
 
@@ -33,7 +35,6 @@ cp grafana/provisioning/alerting/contactpoints.example \
    grafana/provisioning/alerting/contactpoints.yml     # токен бота и chat id
 chmod 644 grafana/provisioning/alerting/contactpoints.yml
 
-docker compose up -d loki               # ← СНАЧАЛА Loki, см. ниже
 docker compose up -d
 docker compose ps
 ```
@@ -59,7 +60,7 @@ flowchart LR
         PROC["/proc, /sys"]
         CG["cgroups контейнеров"]
         VARLOG["/var/log"]
-        DOCKERD["Демон Docker"]
+        DOCKERLOGS["/var/lib/docker/containers<br/>*-json.log"]
     end
 
     subgraph STACK["Стек monitoring"]
@@ -77,9 +78,9 @@ flowchart LR
     NE -->|читает| PROC
     CAD -->|читает| CG
     PT -->|читает| VARLOG
+    PT -->|читает| DOCKERLOGS
 
     PT -->|push| LOKI
-    DOCKERD -->|драйвер loki<br/>stdout контейнеров| LOKI
 
     PROM -->|scrape| NE
     PROM -->|scrape| CAD
@@ -94,20 +95,11 @@ flowchart LR
     PROXY --> TG
 ```
 
-**Логи приходят в Loki двумя путями.** Драйвер логирования Docker отправляет stdout контейнеров напрямую из демона. Promtail читает системные логи хоста из файлов.
+**Один агент, два источника.** Promtail читает системные логи хоста из `/var/log` и логи всех контейнеров из `/var/lib/docker/containers/*/*-json.log`. Демон Docker пишет их туда сам — плагинов и сетевых зависимостей в цепочке нет.
 
-**Loki и promtail исключены из драйвера** и пишут в `json-file`. Приёмник логов и агент их сбора не должны зависеть от того, кого обслуживают: при подключённом драйвере контейнеры не завершались ни по `SIGTERM`, ни по `SIGKILL`, ожидая записи в недоступный Loki, и блокировали демон. После исключения остановка стека занимает полторы секунды вместо семидесяти восьми.
+**Почему не драйвер логирования.** В первой версии stdout контейнеров уходил в Loki напрямую из демона. Это создавало круговую зависимость: приёмник логов жил в том же стеке, что и его источники. Контейнеры не могли завершиться, ожидая записи в недоступный Loki, — не помогал ни `SIGTERM`, ни `SIGKILL`, а в тяжёлых случаях блокировался сам демон Docker.
 
-**Отсюда требование запускать Loki первым.** Пока он не поднят, остальные не могут записать логи. Если стек залип:
-
-```bash
-docker compose down --timeout 5
-docker rm -f $(docker ps -aq --filter name=monitoring)
-sudo systemctl restart docker        # если завис сам демон
-docker compose up -d loki && sleep 15 && docker compose up -d
-```
-
-Правильное решение для прода — выносить Loki на отдельную машину. Здесь он в стеке сознательно, ради компактности.
+Файловый сбор эту связь разрывает. Логи попадают на диск независимо от состояния Loki, promtail помнит позиции чтения и после восстановления дочитывает с того места, где остановился. Ничего не теряется, порядок запуска значения не имеет.
 
 ---
 
@@ -253,6 +245,7 @@ flowchart LR
         ROOTFS["/"]
         SYSFS["/sys, /var/run"]
         LOGS["/var/log"]
+        DLOGS["/var/lib/docker/containers"]
     end
 
     subgraph SVC["Контейнеры"]
@@ -283,6 +276,7 @@ flowchart LR
     ROOTFS -->|":ro"| CAD
     SYSFS -->|":ro"| CAD
     LOGS -->|":ro"| PT
+    DLOGS -->|":ro"| PT
 
     PROM --> PD
     LOKI --> LD
@@ -361,9 +355,15 @@ curl -s localhost:9090/api/v1/targets | python3 -m json.tool | grep -E '"job"|"h
 curl -sG 'localhost:9090/api/v1/query' --data-urlencode 'query=node_memory_MemAvailable_bytes' | python3 -m json.tool
 curl -sG 'localhost:9090/api/v1/query' --data-urlencode 'query=container_memory_usage_bytes{name!=""}' | python3 -m json.tool | grep '"name"'
 
-# логи
+# логи: должны быть метки job, container_id, stream
 curl -s localhost:3100/ready
 curl -s 'localhost:3100/loki/api/v1/labels' | python3 -m json.tool
+curl -s 'localhost:3100/loki/api/v1/label/job/values' | python3 -m json.tool
+
+# все сервисы на json-file — драйвера Loki больше нет
+for c in prometheus grafana node-exporter loki promtail cadvisor; do
+  echo -n "$c: "; docker inspect -f '{{.HostConfig.LogConfig.Type}}' monitoring-$c-1
+done
 
 # ретенция
 curl -s localhost:9090/api/v1/status/flags | python3 -m json.tool | grep retention
@@ -409,10 +409,36 @@ docker run --rm -v monitoring_grafanadata:/data -v $(pwd):/backup alpine \
 
 ---
 
+---
+
+## Две реализации сбора логов
+
+| Ветка | Как собираются логи контейнеров | Компромисс |
+|---|---|---|
+| [`main`](../../tree/main) | драйвер логирования Loki, напрямую из демона | настройка проще, метки приходят готовыми, но круговая зависимость: контейнеры не могут завершиться, пока Loki недоступен |
+| `file-logs` | promtail читает `/var/lib/docker/containers/*/*-json.log` | конфиг сложнее — нужен разбор JSON и извлечение ID из пути; зато нет зависимости, логи переживают недоступность Loki |
+
+Вторая версия появилась после трёх залипаний стека при перезапуске: `docker compose restart prometheus` не завершался, `docker compose down` висел 78 секунд с ошибкой, в тяжёлом случае переставал отвечать сам демон.
+
+Файловый сбор — то, как это устроено в Kubernetes: контейнеры пишут в stdout, kubelet складывает в файлы, агент их читает. Драйверов логирования там нет как класса.
+
+**Что изменилось по метками.** В `main` логи контейнеров помечались `compose_project` и `compose_service` — плагин добавлял их сам. Здесь метки другие:
+
+```
+{job="containerlogs"}              все контейнеры
+{container_id="8e48db3b2152"}      конкретный, короткий ID как в docker ps
+{stream="stderr"}                  только ошибки
+{job="varlogs"}                    системные логи хоста
+```
+
+Сопоставить ID с именем: `docker ps --format '{{.ID}}\t{{.Names}}'`
+
+**Побочный выигрыш:** логи самих Loki и promtail теперь тоже попадают в Grafana. В первой версии оба были исключены из драйвера, и смотреть их можно было только через `docker compose logs`.
+
 ## Что можно доработать
 
 - **Прокси на самом сервере** вместо SSH-туннеля — уберёт зависимость от открытой сессии. Либо переход на SMTP.
-- **Переход на файловый сбор логов** вместо драйвера: promtail читает `/var/lib/docker/containers/*/*-json.log`. Устраняет круговую зависимость и требование запускать Loki первым.
+- **Имена контейнеров вместо ID в метках.** Сейчас `container_id` — короткий хэш. Имя лежит в `config.v2.json` рядом с логом, но promtail его не читает; альтернатива — Docker service discovery, который требует доступа к сокету демона.
 - **Reverse proxy с TLS** перед Grafana вместо SSH-туннеля.
 - **Вложенные маршруты в политике** — critical в один канал, warning в другой. Метка `severity` у правил уже проставлена.
 - **Второй канал доставки** — два независимых пути надёжнее одного.

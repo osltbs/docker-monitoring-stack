@@ -28,17 +28,6 @@ services:
     # прикрепление контейнера к сети. Общая сеть проекта, в ней работает разрешение имён между сервисами
     networks: [monitoring]
     # логи уходят в Loki напрямую из демона Docker, минуя файлы
-    logging:
-      driver: loki
-      options:
-        # плагин работает на хосте и сети Docker не видит
-        loki-url: "http://localhost:3100/loki/api/v1/push"
-        loki-external-labels: "job=docker,service=prometheus"
-        # если Loki не отвечает, складывает логи в буфер и продолжает работу.
-        # при переполнении буфера старые записи отбрасываются - лучше потерять часть логов, чем потерять сервис.
-        mode: non-blocking
-        # Размер этого буфера
-        max-buffer-size: 4m
     healthcheck:
       # CMD — ключевое слово формата, а не команда: выполнить напрямую без sh
       # --spider: только проверить доступность, не скачивать
@@ -73,17 +62,6 @@ services:
       - '--path.rootfs=/host'
     restart: unless-stopped
     networks: [monitoring]
-    logging:
-      driver: loki
-      options:
-        # localhost, а не имя сервиса: плагин работает на хосте,
-        # сеть Docker ему недоступна
-        loki-url: "http://localhost:3100/loki/api/v1/push"
-        loki-external-labels: "job=docker,service=node-exporter"
-        # при недоступности Loki логи копятся в буфере,
-        # а не блокируют контейнер
-        mode: non-blocking
-        max-buffer-size: 4m
     deploy:
       resources:
         limits:
@@ -126,13 +104,6 @@ services:
       - "127.0.0.1:3000:3000"
     restart: unless-stopped
     networks: [monitoring]
-    logging:
-      driver: loki
-      options:
-        loki-url: "http://localhost:3100/loki/api/v1/push"
-        loki-external-labels: "job=docker,service=grafana"
-        mode: non-blocking
-        max-buffer-size: 4m
     # ждём готовности источников данных, а не просто их запуска:
     # без condition Grafana стартовала бы раньше и получила connection refused
     depends_on:
@@ -199,25 +170,24 @@ services:
     image: grafana/promtail:3.3.2
     command: -config.file=/etc/promtail/config.yml -config.expand-env=true
     environment:
-      HOSTNAME: ${HOSTNAME}
+      HOSTNAME: ${HOSTNAME:-unknown}
     volumes:
       # какие файлы читать и куда отправлять
       - ./promtail/promtail-config.yml:/etc/promtail/config.yml:ro
       # системные логи хоста только на чтение: syslog, auth.log, kern.log, ufw.log
       - /var/log:/var/log:ro
+      # логи контейнеров: сами файлы и метаданные Docker
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - promtailpos:/tmp
     restart: unless-stopped
     networks: [monitoring]
     # service_started, а не service_healthy: promtail переживает временную
     # недоступность Loki — он ретраит и помнит позиции в файлах,
     # так что после восстановления дочитает с того места, где остановился
-    depends_on:
-      loki:
-        condition: service_started
     deploy:
       resources:
         limits:
-          memory: 128M
+          memory: 256M
 
   # cadvisor — метрики контейнеров: процессор, память, сеть по каждому.
   # node-exporter рассказывает про хост целиком и отдельные контейнеры не видит.
@@ -252,13 +222,6 @@ services:
       - '--store_container_labels=false'
     restart: unless-stopped
     networks: [monitoring]
-    logging:
-      driver: loki
-      options:
-        loki-url: "http://localhost:3100/loki/api/v1/push"
-        loki-external-labels: "job=docker,service=cadvisor"
-        mode: non-blocking
-        max-buffer-size: 4m
     deploy:
       resources:
         limits:

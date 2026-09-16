@@ -378,7 +378,7 @@
     {
       "id": 8,
       "type": "timeseries",
-      "title": "Поток логов по сервисам",
+      "title": "Поток логов по контейнерам",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -392,8 +392,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by(compose_service) (rate({compose_project=\"monitoring\"}[5m]))",
-          "legendFormat": "{{compose_service}}"
+          "expr": "sum by(container_id) (rate({job=\"containerlogs\"}[5m]))",
+          "legendFormat": "{{container_id}}"
         }
       ],
       "fieldConfig": {

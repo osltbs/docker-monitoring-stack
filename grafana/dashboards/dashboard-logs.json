@@ -212,7 +212,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{compose_project=\"monitoring\"} |~ \"(?i)(error|fatal|panic)\"",
+          "expr": "{job=\"containerlogs\"} |~ \"(?i)(error|fatal|panic)\"",
           "queryType": "range"
         }
       ],
