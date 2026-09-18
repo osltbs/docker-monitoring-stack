@@ -888,3 +888,62 @@ groups:
           reducer:
             type: last
           type: query
+
+- orgId: 1
+  name: certs
+  folder: Инфраструктура
+  interval: 1m
+  rules:
+
+  # Сертификат истекает. Метрику пишет scripts/cert-expiry.sh
+  # в textfile-коллектор node-exporter, запуск по таймеру раз в сутки.
+  # Тот же принцип, что у disk-predict-full: предупреждать заранее,
+  # а не по факту.
+  - uid: cert-expiring
+    title: Сертификат скоро истечёт
+    condition: B
+    for: 1h
+    noDataState: OK
+    execErrState: Error
+    labels:
+      severity: warning
+    annotations:
+      summary: TLS-сертификат истекает менее чем через 14 дней
+      description: 'Осталось {{ printf "%.0f" $values.A.Value }} дней'
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: (ssl_cert_expiry_seconds - time()) / 86400
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: A
+    - refId: B
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        expression: A
+        refId: B
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 14
+          operator:
+            type: and
+          query:
+            params:
+            - A
+          reducer:
+            type: last
+          type: query

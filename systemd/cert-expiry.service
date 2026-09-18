@@ -1,0 +1,7 @@
+[Unit]
+Description=Обновить метрику срока действия TLS-сертификата
+
+[Service]
+Type=oneshot
+User=
+ExecStart=/путь/к/проекту/scripts/cert-expiry.sh

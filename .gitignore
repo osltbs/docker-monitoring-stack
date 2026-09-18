@@ -10,3 +10,9 @@ grafana/provisioning/alerting/contactpoints.yml
 # Системное
 .DS_Store
 Thumbs.db
+
+# Сертификаты
+nginx/certs/*.key
+nginx/certs/*.crt
+nginx/certs/*.pem
+node-exporter-textfile/*.prom

@@ -1,10 +1,10 @@
 # Стек мониторинга в Docker Compose
 
-Prometheus, Grafana, Loki, promtail, cadvisor и node-exporter в контейнерах. Метрики хоста и контейнеров, системные логи и логи контейнеров в одном интерфейсе, уведомления в Telegram.
+Prometheus, Grafana, Loki, promtail, cadvisor, node-exporter и nginx в контейнерах. Метрики хоста и контейнеров, системные логи и логи контейнеров в одном интерфейсе, уведомления в Telegram.
 
 Учебный проект с прицелом на эксплуатационную пригодность: тома для данных, конфиги в Git, ограничения ресурсов, проверки готовности, ретенция, работающие оповещения. Всё настраивается файлами — дашборды, источники данных и правила алертов лежат в репозитории, а не в базе Grafana.
 
-> **Ветка `file-logs`.** Логи контейнеров собираются чтением файлов, а не драйвером логирования Loki. Отличия от `main` — в разделе [«Две реализации сбора логов»](#две-реализации-сбора-логов).
+> **Ветка `tls`.** Наружу выходит nginx с TLS, Grafana за ним порт не публикует. Логи контейнеров собираются чтением файлов. Сравнение веток — в разделе [«Три ветки»](#три-ветки).
 
 ---
 
@@ -17,11 +17,12 @@ Prometheus, Grafana, Loki, promtail, cadvisor и node-exporter в контейн
 | cadvisor      | метрики контейнеров из cgroups        | 8080 (только внутри сети) |
 | loki          | приём и хранение логов                | 3100 (loopback)           |
 | promtail      | сбор логов: `/var/log` и контейнеры   | 9080 (только внутри сети) |
-| grafana       | визуализация, алерты, уведомления     | 3000 (loopback)           |
+| grafana       | визуализация, алерты, уведомления     | только внутри сети        |
+| nginx         | reverse proxy с TLS                   | 80, 443 (наружу)          |
 
-Публикуемые порты слушают только `127.0.0.1` — снаружи виртуалки недоступны, доступ через SSH-туннель.
+Наружу опубликован единственный сервис — nginx. Prometheus и Loki слушают `127.0.0.1` и доступны через SSH-туннель; Grafana не публикует порт вовсе.
 
-**Что получается:** 4 дашборда (36 панелей), 16 правил оповещения, ретенция метрик и логов по 7 дней, стек поднимается одной командой без порядка запуска.
+**Что получается:** 4 дашборда (36 панелей), 17 правил оповещения, ретенция метрик и логов по 7 дней, доступ по HTTPS, стек оформлен как служба systemd.
 
 ---
 
@@ -35,17 +36,25 @@ cp grafana/provisioning/alerting/contactpoints.example \
    grafana/provisioning/alerting/contactpoints.yml     # токен бота и chat id
 chmod 644 grafana/provisioning/alerting/contactpoints.yml
 
+./scripts/gen-cert.sh monitoring.lan    # самоподписанный сертификат
+
 docker compose up -d
 docker compose ps
 ```
 
-Доступ с рабочей машины:
+Добавь запись в `hosts` рабочей машины:
 
-```bash
-ssh -L 3000:127.0.0.1:3000 -L 9090:127.0.0.1:9090 <пользователь>@<сервер>
+```
+<адрес сервера>  monitoring.lan
 ```
 
-Дальше `http://localhost:3000`, логин `admin`, пароль из `.env`.
+Дальше `https://monitoring.lan`, логин `admin`, пароль из `.env`. Браузер предупредит о недоверенном издателе — сертификат самоподписанный, это ожидаемо.
+
+Интерфейсы Prometheus и Loki наружу не выведены; если понадобятся напрямую:
+
+```bash
+ssh -L 9090:127.0.0.1:9090 -L 3100:127.0.0.1:3100 <пользователь>@<сервер>
+```
 
 ---
 
@@ -116,8 +125,9 @@ flowchart TB
     subgraph VM["Виртуалка"]
         ETH["enp0s3"]
 
+        NGX["nginx :80 / :443<br/>TLS, reverse proxy"]
+
         subgraph LO["Loopback хоста"]
-            P3000["127.0.0.1:3000"]
             P9090["127.0.0.1:9090"]
             P3100["127.0.0.1:3100"]
         end
@@ -127,7 +137,7 @@ flowchart TB
 
         subgraph NET["Сеть monitoring — 172.18.0.0/16"]
             direction TB
-            GRAF["grafana :3000"]
+            GRAF["grafana :3000<br/>наружу не публикуется"]
             PROM["prometheus :9090"]
             LOKI["loki :3100"]
             NE["node-exporter :9100"]
@@ -136,10 +146,11 @@ flowchart TB
         end
     end
 
-    BROWSER -->|"ssh -L 3000, 9090"| ETH
-    ETH --> P3000
+    BROWSER -->|"https"| ETH
+    BROWSER -->|"ssh -L 9090"| ETH
+    ETH --> NGX
     ETH --> P9090
-    P3000 --> GRAF
+    NGX -->|"grafana:3000"| GRAF
     P9090 --> PROM
     P3100 --> LOKI
 
@@ -213,7 +224,7 @@ flowchart TB
 
 Алерты ведутся **средствами Grafana**, а не через Alertmanager: для одного сервера с одним экземпляром Prometheus отдельный маршрутизатор избыточен. Всё в `grafana/provisioning/alerting/` — правила, политика, точка контакта.
 
-**16 правил в пяти группах:** место на диске и прогноз заполнения, inode, iowait, память, swap, OOM, нагрузка, расхождение часов, доступность целей, приём метрик и логов, перезапуски контейнеров, приближение к лимиту памяти, всплеск неудачных входов по SSH.
+**17 правил в шести группах:** место на диске и прогноз заполнения, inode, iowait, память, swap, OOM, нагрузка, расхождение часов, доступность целей, приём метрик и логов, перезапуски контейнеров, приближение к лимиту памяти, всплеск неудачных входов по SSH, истечение TLS-сертификата.
 
 Отдельно стоит отметить `disk-predict-full`: через `predict_linear` он смотрит тренд за шесть часов и предупреждает, что место кончится в ближайшие четыре. Обычный порог «осталось 10%» срабатывает, когда реагировать уже поздно.
 
@@ -331,7 +342,7 @@ sudo sh -c 'du -sh /var/lib/docker/volumes/monitoring_*'
 
 ## Секреты
 
-Пароль Grafana в `.env`, токен бота в `contactpoints.yml`. Оба исключены из Git, рядом лежат шаблоны.
+Пароль Grafana в `.env`, токен бота в `contactpoints.yml`, закрытый ключ сертификата в `nginx/certs/`. Всё исключено из Git; рядом лежат шаблоны и скрипт генерации.
 
 Переменная объявлена обязательной — без `.env` compose откажется запускаться, вместо того чтобы стартовать с паролем по умолчанию:
 
@@ -370,8 +381,22 @@ curl -s localhost:9090/api/v1/status/flags | python3 -m json.tool | grep retenti
 curl -s localhost:3100/config | grep -A3 retention_period
 
 # дашборды и правила (пароль спросит, в команду не вставлять)
-curl -s -u admin localhost:3000/api/search?query= | python3 -m json.tool | grep '"title"'
-curl -s -u admin localhost:3000/api/prometheus/grafana/api/v1/rules | python3 -m json.tool | grep -E '"name"|"health"'
+curl -sk -u admin https://monitoring.lan/api/search?query= | python3 -m json.tool | grep '"title"'
+curl -sk -u admin https://monitoring.lan/api/prometheus/grafana/api/v1/rules | python3 -m json.tool | grep -E '"name"|"health"'
+
+# TLS: редирект, заголовки, сам сертификат
+curl -sI http://monitoring.lan | head -3
+curl -skI https://monitoring.lan | grep -iE 'x-frame|x-content|referrer'
+echo | openssl s_client -connect monitoring.lan:443 -servername monitoring.lan 2>/dev/null \
+  | openssl x509 -noout -subject -dates -ext subjectAltName
+
+# Grafana больше не торчит наружу
+docker compose ps | grep grafana      # колонка PORTS пуста
+ss -tlnp | grep 3000                  # ничего
+
+# служба и таймер
+systemctl status monitoring.service --no-pager
+systemctl list-timers --all | grep cert
 
 # прокси доступен из контейнера
 docker compose exec grafana sh -c 'timeout 5 nc -z host.docker.internal 10808 && echo достижим'
@@ -404,25 +429,45 @@ docker run --rm -v monitoring_grafanadata:/data -v $(pwd):/backup alpine \
 
 | Файл | Что внутри |
 |---|---|
-| `DEBUG.md` | 18 разобранных случаев диагностики из практики сборки |
+| `DEBUG.md` | 2 разобранных случая диагностики из практики сборки     |
 | `grafana/dashboards/README.md` | описание всех 36 панелей и запросов |
 
 ---
 
 ---
 
-## Две реализации сбора логов
+## Три ветки
 
-| Ветка | Как собираются логи контейнеров | Компромисс |
+| Ветка | Отличие | Компромисс |
 |---|---|---|
-| [`main`](../../tree/main) | драйвер логирования Loki, напрямую из демона | настройка проще, метки приходят готовыми, но круговая зависимость: контейнеры не могут завершиться, пока Loki недоступен |
-| `file-logs` | promtail читает `/var/lib/docker/containers/*/*-json.log` | конфиг сложнее — нужен разбор JSON и извлечение ID из пути; зато нет зависимости, логи переживают недоступность Loki |
+| [`main`](../../tree/main) | драйвер логирования Loki, доступ через SSH-туннель | настройка проще, метки приходят готовыми, но круговая зависимость: контейнеры не могут завершиться, пока Loki недоступен |
+| [`file-logs`](../../tree/file-logs) | promtail читает `/var/lib/docker/containers/*/*-json.log` | конфиг сложнее — нужен разбор JSON и извлечение ID из пути; зато нет зависимости |
+| `tls` | + nginx с TLS, правило на истечение сертификата, systemd | доступ по HTTPS без туннеля; сертификат самоподписанный |
 
-Вторая версия появилась после трёх залипаний стека при перезапуске: `docker compose restart prometheus` не завершался, `docker compose down` висел 78 секунд с ошибкой, в тяжёлом случае переставал отвечать сам демон.
+Каждая следующая ветка ответвлена от предыдущей — видна эволюция решения,
+а не три параллельных варианта. Дифф между реализациями:
+[`main...file-logs`](../../compare/main...file-logs),
+[`file-logs...tls`](../../compare/file-logs...tls).
 
-Файловый сбор — то, как это устроено в Kubernetes: контейнеры пишут в stdout, kubelet складывает в файлы, агент их читает. Драйверов логирования там нет как класса.
+### Почему отказались от драйвера логирования
 
-**Что изменилось по метками.** В `main` логи контейнеров помечались `compose_project` и `compose_service` — плагин добавлял их сам. Здесь метки другие:
+Приёмник логов жил в том же стеке, что и его источники. Контейнеры не могли
+завершиться, ожидая записи в недоступный Loki: не помогал ни `SIGTERM`,
+ни `SIGKILL`, а в тяжёлых случаях блокировался сам демон Docker.
+
+| | драйвер | файлы |
+|---|---|---|
+| `docker compose restart prometheus` | зависает | 0.5 с |
+| `docker compose down` | 78 с с ошибкой | 2.6 с |
+| порядок запуска | Loki первым | любой |
+| `docker compose logs` | частично | все сервисы |
+
+Файловый сбор — то, как это устроено в Kubernetes: контейнеры пишут в stdout,
+kubelet складывает в файлы, агент их читает. Драйверов логирования там нет
+как класса.
+
+**Метки изменились.** В `main` логи контейнеров помечались `compose_project`
+и `compose_service` — плагин добавлял их сам. Здесь:
 
 ```
 {job="containerlogs"}              все контейнеры
@@ -433,13 +478,88 @@ docker run --rm -v monitoring_grafanadata:/data -v $(pwd):/backup alpine \
 
 Сопоставить ID с именем: `docker ps --format '{{.ID}}\t{{.Names}}'`
 
-**Побочный выигрыш:** логи самих Loki и promtail теперь тоже попадают в Grafana. В первой версии оба были исключены из драйвера, и смотреть их можно было только через `docker compose logs`.
+---
+
+## TLS и reverse proxy
+
+Наружу выходит один nginx на портах 80 и 443. Grafana за ним порт не публикует
+вовсе и доступна только изнутри сети по имени `grafana:3000`.
+
+**Сертификат самоподписанный**, генерируется скриптом и в репозиторий
+не попадает:
+
+```bash
+./scripts/gen-cert.sh monitoring.lan
+```
+
+Для боевого домена вместо этого берётся Let's Encrypt — конфигурация nginx
+при этом не меняется, путь для ACME-challenge уже предусмотрен.
+
+**`subjectAltName` в сертификате обязателен.** Современные браузеры игнорируют
+поле `CN` и проверяют только SAN; без него будет `ERR_CERT_COMMON_NAME_INVALID`
+даже при верном `CN`.
+
+**Заголовки, которые проставляет nginx:**
+
+```nginx
+proxy_set_header X-Real-IP         $remote_addr;
+proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+```
+
+Без них Grafana видела бы адрес контейнера nginx вместо клиента и строила
+ссылки с `http://`. Плюс `GF_SERVER_ROOT_URL` в переменных — иначе абсолютные
+ссылки в уведомлениях вели бы на `localhost:3000`.
+
+**HSTS намеренно закомментирован.** Он заставил бы браузер запомнить домен как
+HTTPS-only на год, и при смене самоподписанного сертификата это мешало бы.
+
+### Срок действия сертификата
+
+Скрипт `scripts/cert-expiry.sh` пишет метрику в textfile-коллектор
+node-exporter, таймер systemd запускает его раз в сутки. Правило
+`cert-expiring` предупреждает за 14 дней:
+
+```
+(ssl_cert_expiry_seconds - time()) / 86400 < 14
+```
+
+Тот же принцип, что у `disk-predict-full`: предупреждать заранее, а не по факту.
+
+---
+
+## Автозапуск
+
+Стек оформлен службой systemd — `systemd/monitoring.service`:
+
+```bash
+sudo systemctl start monitoring
+sudo systemctl stop monitoring
+systemctl status monitoring
+```
+
+`Type=oneshot` с `RemainAfterExit=yes`: compose завершается сразу после запуска
+контейнеров, и без этой пары systemd счёл бы службу упавшей.
+
+Служба работает под непривилегированным пользователем, доступ к сокету Docker
+даёт членство в группе `docker`. Стоит помнить, что это равносильно root
+на хосте.
+
+**Дублирование с `restart: unless-stopped`.** Оба механизма поднимают контейнеры
+после перезагрузки. В проде выбирают что-то одно; здесь оставлены оба
+как упражнение.
+
+Юниты в каталоге `systemd/` — копии для истории, абсолютные пути заменены
+плейсхолдерами. Устанавливаются копированием в `/etc/systemd/system/`.
+
+---
 
 ## Что можно доработать
 
-- **Прокси на самом сервере** вместо SSH-туннеля — уберёт зависимость от открытой сессии. Либо переход на SMTP.
+- **Прокси на самом сервере** вместо обратного SSH-туннеля для уведомлений — уберёт зависимость от открытой сессии. Либо переход на SMTP.
+- **Сертификат от Let's Encrypt** вместо самоподписанного — потребует публичного домена; конфигурация nginx не меняется.
+- **Правило на всплеск ошибок 5xx** в логах nginx через LogQL.
 - **Имена контейнеров вместо ID в метках.** Сейчас `container_id` — короткий хэш. Имя лежит в `config.v2.json` рядом с логом, но promtail его не читает; альтернатива — Docker service discovery, который требует доступа к сокету демона.
-- **Reverse proxy с TLS** перед Grafana вместо SSH-туннеля.
 - **Вложенные маршруты в политике** — critical в один канал, warning в другой. Метка `severity` у правил уже проставлена.
 - **Второй канал доставки** — два независимых пути надёжнее одного.
 
@@ -454,6 +574,18 @@ docker run --rm -v monitoring_grafanadata:/data -v $(pwd):/backup alpine \
 ├── .gitignore
 ├── README.md
 ├── DEBUG.md
+├── scripts/
+│   ├── gen-cert.sh              ← генерация сертификата
+│   └── cert-expiry.sh           ← метрика срока действия
+├── systemd/
+│   ├── monitoring.service
+│   ├── cert-expiry.service
+│   └── cert-expiry.timer
+├── nginx/
+│   ├── nginx.conf
+│   ├── conf.d/grafana.conf
+│   └── certs/                   ← сертификаты, НЕ в Git
+├── node-exporter-textfile/      ← метрика от скрипта
 ├── prometheus/
 │   ├── prometheus.yml
 │   └── rules/alerts.yml

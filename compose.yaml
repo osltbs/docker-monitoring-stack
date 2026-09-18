@@ -45,6 +45,7 @@ services:
       resources:
         limits:
           memory: 512M
+
   # node-exporter — метрики хоста: процессор, память, диск, сеть, часы.
   # Намеренно нарушает изоляцию: его задача рассказать про машину,
   # а не про себя. Без этих настроек отчитывался бы о собственном контейнере.
@@ -57,15 +58,19 @@ services:
       # rslave — новые монтирования на хосте становятся видны внутри,
       # обратно ничего не распространяется
       - /:/host:ro,rslave
+      # подключить каталог к node-exporter для проверки срока сертификата
+      - ./node-exporter-textfile:/textfile:ro
     command:
       # искать /proc и /sys по префиксу /host, а не свои собственные
       - '--path.rootfs=/host'
+      - '--collector.textfile.directory=/textfile'
     restart: unless-stopped
     networks: [monitoring]
     deploy:
       resources:
         limits:
           memory: 128M
+
   # Создание контейнера Grafana — визуализация метрик и логов, вычисление правил, уведомления
   grafana:
     image: grafana/grafana:11.5.1
@@ -91,6 +96,9 @@ services:
       GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      # сказать Grafana, что она за прокси
+      GF_SERVER_ROOT_URL: "https://monitoring.lan/"
+      GF_SERVER_DOMAIN: "monitoring.lan"
     volumes:
       # том: база Grafana — дашборды из UI, пользователи, история алертов
       - grafanadata:/var/lib/grafana
@@ -98,10 +106,6 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       # дашборды как код — правятся файлами, не через интерфейс
       - ./grafana/dashboards:/etc/grafana/dashboards:ro
-    ports:
-      # только loopback хоста: снаружи виртуалки недоступна,
-      # доступ через SSH-туннель
-      - "127.0.0.1:3000:3000"
     restart: unless-stopped
     networks: [monitoring]
     # ждём готовности источников данных, а не просто их запуска:
@@ -166,6 +170,7 @@ services:
   # При подключённом драйвере контейнер не завершался ни по SIGTERM, ни по
   # SIGKILL: ждал записи в Loki, которого уже не было. В тяжёлых случаях
   # блокировался сам демон Docker.
+
   promtail:
     image: grafana/promtail:3.3.2
     command: -config.file=/etc/promtail/config.yml -config.expand-env=true
@@ -188,6 +193,33 @@ services:
       resources:
         limits:
           memory: 256M
+
+  # nginx — reverse proxy с TLS. Единственный сервис, публикуемый наружу.
+  # Grafana за ним больше не публикует порт вовсе.
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      grafana:
+        condition: service_started
+    restart: unless-stopped
+    networks: [monitoring]
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
 
   # cadvisor — метрики контейнеров: процессор, память, сеть по каждому.
   # node-exporter рассказывает про хост целиком и отдельные контейнеры не видит.
