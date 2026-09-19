@@ -2,6 +2,11 @@ services:
   # Создание контейнера Prometheus для сбора метрик
   prometheus:
     image: prom/prometheus:v3.1.0
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     command:
       # первые два флага — из CMD образа, их нельзя потерять
       # секция command заменяет CMD целиком
@@ -51,6 +56,11 @@ services:
   # а не про себя. Без этих настроек отчитывался бы о собственном контейнере.
   node-exporter:
     image: prom/node-exporter:v1.8.2
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     # PID namespace хоста: видит все процессы системы, а не только свои
     pid: host
     volumes:
@@ -74,6 +84,11 @@ services:
   # Создание контейнера Grafana — визуализация метрик и логов, вычисление правил, уведомления
   grafana:
     image: grafana/grafana:11.5.1
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     # host.docker.internal резолвится в шлюз текущей сети автоматически —
     # не зависит от того, какую подсеть выдал Docker при пересоздании
     extra_hosts:
@@ -131,6 +146,11 @@ services:
   # Отсюда же требование запускать его первым: docker compose up -d loki
   loki:
     image: grafana/loki:3.3.2
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     # свой конфиг вместо встроенного local-config.yaml — ради ретенции.
     # command заменяет CMD образа целиком, но у Loki там только этот флаг
     command: -config.file=/etc/loki/loki-config.yaml
@@ -173,6 +193,13 @@ services:
 
   promtail:
     image: grafana/promtail:3.3.2
+    read_only: true
+    group_add:
+      - adm
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     command: -config.file=/etc/promtail/config.yml -config.expand-env=true
     environment:
       HOSTNAME: ${HOSTNAME:-unknown}
@@ -198,6 +225,20 @@ services:
   # Grafana за ним больше не публикует порт вовсе.
   nginx:
     image: nginx:1.27-alpine
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
     ports:
       - "80:80"
       - "443:443"
@@ -238,8 +279,7 @@ services:
       - /dev/kmsg:/dev/kmsg
     volumes:
       - /:/rootfs:ro
-      # сокет Docker — для сопоставления cgroup с именами контейнеров
-      - /var/run:/var/run:ro
+      # # сокет Docker — для сопоставления cgroup с именами контейнеров
       # cgroups: отсюда берутся метрики процессора и памяти
       - /sys:/sys:ro
       - /var/lib/docker/:/var/lib/docker:ro
